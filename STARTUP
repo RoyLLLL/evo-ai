@@ -208,7 +208,39 @@ ALTER TABLE public.users ADD CONSTRAINT users_client_id_fkey FOREIGN KEY (client
 
 
 2. 启动后端
+
+注釋掉：src/utils/crypto.py
+1.
+
+# Create the Fernet object with the key
+# fernet = Fernet(SECRET_KEY.encode() if isinstance(SECRET_KEY, str) else SECRET_KEY)
+
+
+def encrypt_api_key(api_key: str) -> str:
+    """Encrypt an API key before saving in the database"""
+    if not api_key:
+        return ""
+    # try:
+    #     # return fernet.encrypt(api_key.encode()).decode()
+    # except Exception as e:
+    #     logger.error(f"Error encrypting API key: {str(e)}")
+    #     raise
+
+
+def decrypt_api_key(encrypted_key: str) -> str:
+    """Decrypt an API key for use"""
+    if not encrypted_key:
+        return ""
+    # try:
+    #     return fernet.decrypt(encrypted_key.encode()).decode()
+    # except Exception as e:
+    #     logger.error(f"Error decrypting API key: {str(e)}")
+    #     raise
+
+2. 修改env，配置redis
 uvicorn main:app --reload --host 0.0.0.0 --port 8000
 
 
-3. 访问
+3. 啓動前端，
+複製frontend .env
+npm啓動
