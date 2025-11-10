@@ -1,0 +1,214 @@
+1. 创建表
+alembic upgrade head 
+
+SQL:
+1.
+-- public.agent_folders definition
+
+-- Drop table
+
+-- DROP TABLE public.agent_folders;
+
+CREATE TABLE public.agent_folders (
+	id uuid NOT NULL,
+	client_id uuid NULL,
+	"name" varchar NOT NULL,
+	description text NULL,
+	created_at timestamptz DEFAULT now() NULL,
+	updated_at timestamptz NULL,
+	CONSTRAINT agent_folders_pkey PRIMARY KEY (id)
+);
+
+
+-- public.agent_folders foreign keys
+
+ALTER TABLE public.agent_folders ADD CONSTRAINT agent_folders_client_id_fkey FOREIGN KEY (client_id) REFERENCES public.clients(id) ON DELETE CASCADE;
+
+2.
+-- public.agents definition
+
+-- Drop table
+
+-- DROP TABLE public.agents;
+
+CREATE TABLE public.agents (
+	id uuid NOT NULL,
+	client_id uuid NULL,
+	"name" varchar NOT NULL,
+	description text NULL,
+	"type" varchar NOT NULL,
+	model varchar NULL,
+	api_key_id uuid NULL,
+	instruction text NULL,
+	agent_card_url varchar NULL,
+	folder_id uuid NULL,
+	config json NULL,
+	created_at timestamptz DEFAULT now() NULL,
+	updated_at timestamptz NULL,
+	"role" varchar NULL,
+	goal text NULL,
+	CONSTRAINT agents_pkey PRIMARY KEY (id),
+	CONSTRAINT check_agent_type CHECK (((type)::text = ANY ((ARRAY['llm'::character varying, 'sequential'::character varying, 'parallel'::character varying, 'loop'::character varying, 'a2a'::character varying, 'workflow'::character varying, 'crew_ai'::character varying, 'task'::character varying])::text[])))
+);
+
+
+-- public.agents foreign keys
+
+ALTER TABLE public.agents ADD CONSTRAINT agents_api_key_id_fkey FOREIGN KEY (api_key_id) REFERENCES public.api_keys(id) ON DELETE SET NULL;
+ALTER TABLE public.agents ADD CONSTRAINT agents_client_id_fkey FOREIGN KEY (client_id) REFERENCES public.clients(id) ON DELETE CASCADE;
+ALTER TABLE public.agents ADD CONSTRAINT agents_folder_id_fkey FOREIGN KEY (folder_id) REFERENCES public.agent_folders(id) ON DELETE SET NULL;
+
+3.
+-- public.alembic_version definition
+
+-- Drop table
+
+-- DROP TABLE public.alembic_version;
+
+CREATE TABLE public.alembic_version (
+	version_num varchar(32) NOT NULL,
+	CONSTRAINT alembic_version_pkc PRIMARY KEY (version_num)
+);
+4. 
+-- public.api_keys definition
+
+-- Drop table
+
+-- DROP TABLE public.api_keys;
+
+CREATE TABLE public.api_keys (
+	id uuid NOT NULL,
+	client_id uuid NULL,
+	"name" varchar NOT NULL,
+	provider varchar NOT NULL,
+	encrypted_key varchar NOT NULL,
+	created_at timestamptz DEFAULT now() NULL,
+	updated_at timestamptz NULL,
+	is_active bool NULL,
+	CONSTRAINT api_keys_pkey PRIMARY KEY (id)
+);
+
+
+-- public.api_keys foreign keys
+
+ALTER TABLE public.api_keys ADD CONSTRAINT api_keys_client_id_fkey FOREIGN KEY (client_id) REFERENCES public.clients(id) ON DELETE CASCADE;
+5.
+-- public.audit_logs definition
+
+-- Drop table
+
+-- DROP TABLE public.audit_logs;
+
+CREATE TABLE public.audit_logs (
+	id uuid NOT NULL,
+	user_id uuid NULL,
+	"action" varchar NOT NULL,
+	resource_type varchar NOT NULL,
+	resource_id varchar NULL,
+	details json NULL,
+	ip_address varchar NULL,
+	user_agent varchar NULL,
+	created_at timestamptz DEFAULT now() NULL,
+	CONSTRAINT audit_logs_pkey PRIMARY KEY (id)
+);
+
+
+-- public.audit_logs foreign keys
+
+ALTER TABLE public.audit_logs ADD CONSTRAINT audit_logs_user_id_fkey FOREIGN KEY (user_id) REFERENCES public.users(id) ON DELETE SET NULL;
+
+6.
+-- public.clients definition
+
+-- Drop table
+
+-- DROP TABLE public.clients;
+
+CREATE TABLE public.clients (
+	id uuid NOT NULL,
+	"name" varchar NOT NULL,
+	email varchar NOT NULL,
+	created_at timestamptz DEFAULT now() NULL,
+	updated_at timestamptz NULL,
+	CONSTRAINT clients_pkey PRIMARY KEY (id)
+);
+CREATE UNIQUE INDEX ix_clients_email ON public.clients USING btree (email);
+
+7.
+-- public.mcp_servers definition
+
+-- Drop table
+
+-- DROP TABLE public.mcp_servers;
+
+CREATE TABLE public.mcp_servers (
+	id uuid NOT NULL,
+	"name" varchar NOT NULL,
+	description text NULL,
+	config_type varchar NOT NULL,
+	config_json json NOT NULL,
+	environments json NOT NULL,
+	tools json NOT NULL,
+	"type" varchar NOT NULL,
+	created_at timestamptz DEFAULT now() NULL,
+	updated_at timestamptz NULL,
+	CONSTRAINT check_mcp_server_config_type CHECK (((config_type)::text = ANY ((ARRAY['studio'::character varying, 'sse'::character varying])::text[]))),
+	CONSTRAINT check_mcp_server_type CHECK (((type)::text = ANY ((ARRAY['official'::character varying, 'community'::character varying])::text[]))),
+	CONSTRAINT mcp_servers_pkey PRIMARY KEY (id)
+);
+
+8. 
+-- public.tools definition
+
+-- Drop table
+
+-- DROP TABLE public.tools;
+
+CREATE TABLE public.tools (
+	id uuid NOT NULL,
+	"name" varchar NOT NULL,
+	description text NULL,
+	config_json json NOT NULL,
+	environments json NOT NULL,
+	created_at timestamptz DEFAULT now() NULL,
+	updated_at timestamptz NULL,
+	CONSTRAINT tools_pkey PRIMARY KEY (id)
+);
+
+9.
+-- public.users definition
+
+-- Drop table
+
+-- DROP TABLE public.users;
+
+CREATE TABLE public.users (
+	id uuid NOT NULL,
+	email varchar NOT NULL,
+	password_hash varchar NOT NULL,
+	client_id uuid NULL,
+	is_active bool NULL,
+	is_admin bool NULL,
+	email_verified bool NULL,
+	verification_token varchar NULL,
+	verification_token_expiry timestamptz NULL,
+	password_reset_token varchar NULL,
+	password_reset_expiry timestamptz NULL,
+	created_at timestamptz DEFAULT now() NULL,
+	updated_at timestamptz NULL,
+	CONSTRAINT users_pkey PRIMARY KEY (id)
+);
+CREATE UNIQUE INDEX ix_users_email ON public.users USING btree (email);
+
+
+-- public.users foreign keys
+
+ALTER TABLE public.users ADD CONSTRAINT users_client_id_fkey FOREIGN KEY (client_id) REFERENCES public.clients(id) ON DELETE CASCADE;
+
+
+
+2. 启动后端
+uvicorn main:app --reload --host 0.0.0.0 --port 8000
+
+
+3. 访问
