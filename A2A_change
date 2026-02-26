@@ -1,0 +1,225 @@
+Evo AI 项目中需要修改的地方（针对 src/api/a2a_routes.py）
+Evo AI 的 a2a_routes.py 是基于 v0.2.1 的最小实现：使用 FastAPI、HTTP/JSON-RPC、基本方法（如 message/send、tasks/get）、SSE 流式、内存 push 配置和简单 AgentCard。更新到 v0.3.0 需要处理 breaking changes 和添加新特性，预计修改 15-25% 代码。重点是路径更新、安全增强和数据结构扩展。以下按优先级和影响列出具体修改点（假设你保持 HTTP 为主，不立即加 gRPC）。
+高优先级修改（必须做，否则不兼容）
+
+Well-known URI 路径更新：
+当前：@router.get("/{agent_id}/.well-known/agent.json")
+修改：改为 @router.get("/{agent_id}/.well-known/agent-card.json")
+额外：作为过渡，可同时暴露旧路径，但日志警告“使用新路径”。
+
+AgentCard 数据结构扩展：
+当前：基本 JSON（如 id, name, capabilities）。
+添加新字段：
+signature: 生成签名（用 jwt 或 cryptography 库）。示例：Pythonimport jwt
+PRIVATE_KEY = "your-secret-key"  # 从 config 加载
+card_data = { ... 旧数据 ... }
+signature = jwt.encode(card_data, PRIVATE_KEY, algorithm="RS256")
+card_data["signature"] = signature
+在 get_agent_card 函数中返回更新后的 card_data。
+
+
+SecuritySchemes 支持 mTLS 和 OAuth2 元数据：
+当前：只用 API Key（verify_api_key）。
+添加：扩展 authentication 字段支持 mTLS（用 fastapi-security 或手动校验客户端证书）和 OAuth2 metadataUrl（e.g., "https://auth.example.com/.well-known/openid-configuration"）。
+在 verify_api_key 中添加条件：如果请求指定 mTLS，校验 request.client.certificate。
+
+Skills 安全要求：
+当前：capabilities 数组无 security。
+添加：在每个 capability 中新增 "security": ["oauth2", "mtls"]（根据你的 Agent 需要）。
+更新 AgentCard 生成逻辑以包含此字段。
+
+
+中优先级修改（推荐做，提升兼容性）
+
+新增 RPC 方法：
+添加 agent/getExtendedCard（或官方确切名称，如 "fetch an extended AgentCard"）。
+示例 handler：Pythonif method == "agent/getExtendedCard":
+    # 认证后返回扩展 card（添加 rate_limits 等私有字段）
+    extended_card = { ... card_data, "rate_limits": {"per_minute": 100} }
+    return {"jsonrpc": "2.0", "result": extended_card}
+在 process_a2a_message 的分发中添加。
+
+JSON 字段映射修复：
+在 handle_message_send 中，确保 params["message"] 而非旧的 "request"（如果有）。
+检查所有 JSON-RPC params 以匹配新映射。
+
+Transport 枚举：
+在 AgentCard 中添加 "transports": ["http", "grpc"]（如果支持 gRPC，则添加）。
+
+
+低优先级修改（可选，但建议）
+
+推送通知增强：结合新 SecuritySchemes，支持更多 auth 类型（e.g., OAuth for push）。
+整体测试与文档：用官方 TCK 测试新实现；更新文件头部注释为 “Compliant with A2A v0.3.0”。
+迁移支持：在响应中添加 protocolVersions: ["0.3.0", "0.2.1"]，允许旧客户端协商。
+
+总体工作量：核心 breaking changes（路径 + 签名）可在 1 天内完成；全功能更新（安全 + 新方法）需 3-5 天。建议先更新 AgentCard 和路径，然后逐步添加安全特性。完成后，你的 Evo AI 将能与 v0.3.0 生态无缝集成。如果需要代码 patch 示例，告诉我具体部分！
+
+
+
+以下是针对你提到的修改1的具体代码变更建议：
+目标：将后端 Agent Card 的公开发现路径从 /.well-known/agent.json 改为符合 A2A 较新版本规范的 /.well-known/agent-card.json（这是当前主流推荐路径，许多实现和官方讨论已转向此路径）。
+后端修改（src/api/a2a_routes.py）
+修改前（假设原有代码类似以下形式）
+Python# 原有代码（典型写法）
+@router.get("/{agent_id}/.well-known/agent.json")
+async def get_agent_card(agent_id: str):
+    # ... 验证 agent_id ...
+    card = {
+        "id": f"urn:agent:evo:{agent_id}",
+        "name": "Evo AI Agent",
+        "description": "...",
+        "endpoint": f"https://your-domain.com/a2a/{agent_id}",
+        "capabilities": [...],
+        # ... 其他字段
+    }
+    return card
+修改后（推荐做法）
+Pythonfrom fastapi import APIRouter, HTTPException, Depends
+# ... 其他导入保持不变 ...
+
+router = APIRouter(prefix="/a2a", tags=["a2a-official"])
+
+# 新路径：/.well-known/agent-card.json
+@router.get("/{agent_id}/.well-known/agent-card.json")
+async def get_agent_card(agent_id: str):
+    # 如果你有 agent 验证逻辑，保留
+    # 例如：agent = await get_agent_by_id(agent_id)
+    # if not agent: raise HTTPException(404, "Agent not found")
+
+    card = {
+        "id": f"urn:agent:evo:{agent_id}",
+        "name": "Evo AI Agent",
+        "description": "Evolution API AI Agent supporting A2A protocol",
+        "version": "1.0.0",
+        "protocolVersions": ["0.3.0", "0.2.1"],  # 建议添加，向前兼容
+        "endpoint": f"https://your-domain.com/a2a/{agent_id}",  # 或动态生成
+        "capabilities": [
+            {
+                "skill": "general-assistance",
+                "description": "General purpose assistance",
+                "input_schema": {...},
+                "output_schema": {...},
+            }
+            # ... 你的其他 capabilities
+        ],
+        # 建议添加（可选但推荐）
+        "supportedInterfaces": ["jsonrpc/http"],
+        "defaultInputModes": ["text/plain", "application/json"],
+        "defaultOutputModes": ["text/plain", "application/json"],
+        # 如果以后支持签名，可在这里添加 "signature" 字段
+    }
+
+    return card
+
+
+# 可选：为了向后兼容，临时保留旧路径（生产环境建议后期移除）
+@router.get("/{agent_id}/.well-known/agent.json")
+async def get_agent_card_legacy(agent_id: str):
+    # 可以直接复用新函数，或者返回 301 重定向
+    # return RedirectResponse(url=f"/a2a/{agent_id}/.well-known/agent-card.json")
+    
+    # 或者直接返回相同内容（最简单过渡方式）
+    return await get_agent_card(agent_id)
+推荐做法总结（后端）：
+
+主路径改为 /.well-known/agent-card.json
+保留旧路径作为临时兼容（返回相同内容或 301 重定向）
+在 card 中添加 protocolVersions 字段，声明支持的协议版本（强烈推荐）
+路径中 {agent_id} 保持不变（这是 Evo 项目特有的多 Agent 设计）
+
+前端修改（frontend/app/documentation/page.tsx）
+前端的文档页面通常会展示或测试 Agent Card 的获取情况。常见问题是在代码中硬编码了旧路径，或者在某个输入框/示例中使用了 agent.json。
+假设原有代码片段（常见写法）
+tsx// 可能出现在页面中某个地方
+const agentCardUrl = `${agentUrl}/.well-known/agent.json`;
+
+// 或 fetch 示例
+const fetchAgentCard = async () => {
+  try {
+    const res = await fetch(`${baseUrl}/${agentId}/.well-known/agent.json`);
+    const data = await res.json();
+    setAgentCard(data);
+  } catch (err) {
+    console.error("Failed to fetch agent card", err);
+  }
+};
+修改后建议
+tsx// 1. 修改常量或变量定义（推荐统一使用新路径）
+const AGENT_CARD_PATH = "/.well-known/agent-card.json";  // 新增常量，便于维护
+
+// 使用示例
+const agentCardUrl = `${agentUrl}${AGENT_CARD_PATH}`;   // agentUrl 是 https://xxx.com/a2a/xxxx 这种
+
+// 2. 如果是 fetch 或 axios 调用
+const fetchAgentCard = async () => {
+  if (!agentUrl || !agentId) return;
+  
+  try {
+    const fullUrl = `${agentUrl}/${agentId}${AGENT_CARD_PATH}`;
+    const res = await fetch(fullUrl, {
+      headers: {
+        // 如果需要 API Key 或其他认证
+        "x-api-key": apiKey || "",
+      },
+    });
+    
+    if (!res.ok) {
+      throw new Error(`Failed to fetch agent card: ${res.status}`);
+    }
+    
+    const data = await res.json();
+    setAgentCard(data);
+    toast({ title: "Agent Card loaded", description: "Using .well-known/agent-card.json" });
+  } catch (err) {
+    console.error("Agent Card fetch error:", err);
+    toast({ 
+      variant: "destructive", 
+      title: "Failed to load Agent Card",
+      description: "Try checking the URL or fallback to old path if needed."
+    });
+  }
+};
+
+// 3. 如果页面有硬编码的示例 URL 或文档文字，也要同步修改
+// 例如：
+<p className="text-sm text-muted-foreground">
+  Agent Card is available at: <code>{agentUrl}/{agentId}/.well-known/agent-card.json</code>
+</p>
+
+// 4. 可选：添加兼容性降级逻辑（开发/测试阶段有用）
+const tryFetchAgentCard = async () => {
+  const newPath = `${agentUrl}/${agentId}/.well-known/agent-card.json`;
+  let res = await fetch(newPath);
+  
+  if (!res.ok) {
+    // 降级尝试旧路径
+    console.warn("New agent-card.json not found, trying legacy agent.json");
+    res = await fetch(`${agentUrl}/${agentId}/.well-known/agent.json`);
+  }
+  
+  if (res.ok) {
+    const data = await res.json();
+    setAgentCard(data);
+  }
+};
+前端修改要点总结：
+
+统一使用常量 /.well-known/agent-card.json
+更新所有硬编码字符串和 fetch/axios 调用
+在文档展示区域（如卡片、说明文字）同步改为新路径
+可选添加降级逻辑（仅测试阶段，生产建议移除）
+如果页面有输入框让用户填 Agent Card URL，也建议默认提示新路径
+
+最终建议的升级步骤
+
+先修改后端：添加新路径路由，保留旧路径作为兼容
+修改前端：统一使用新路径常量，更新 fetch 和展示文字
+测试：
+浏览器直接访问 https://your-domain/a2a/{agent_id}/.well-known/agent-card.json 是否返回正确 JSON
+前端文档页的 Agent Card 预览/测试功能是否正常加载
+
+后期（当确认大部分客户端已升级）：移除旧路径的路由
+
+完成后，你的 Evo AI 项目在 Agent 发现部分就基本对齐当前主流 A2A 实现规范了。
+如果你的实际代码和上面假设有较大差异，或者你能提供更具体的代码片段，我可以给出更精确的 diff 风格修改。
