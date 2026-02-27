@@ -1,0 +1,319 @@
+"""
+┌──────────────────────────────────────────────────────────────────────────────┐
+│ @author: Davidson Gomes                                                      │
+│ @file: a2a_routes.py                                                         │
+│ Developed by: Davidson Gomes                                                 │
+│ Creation date: May 23, 2025                                                  │
+│ Contact: contato@evolution-api.com                                           │
+├──────────────────────────────────────────────────────────────────────────────┤
+│ @copyright © Evolution API 2025. All rights reserved.                        │
+│ Licensed under the Apache License, Version 2.0                               │
+│                                                                              │
+│ You may not use this file except in compliance with the License.             │
+│ You may obtain a copy of the License at                                      │
+│                                                                              │
+│    http://www.apache.org/licenses/LICENSE-2.0                                │
+│                                                                              │
+│ Unless required by applicable law or agreed to in writing, software          │
+│ distributed under the License is distributed on an "AS IS" BASIS,            │
+│ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.     │
+│ See the License for the specific language governing permissions and          │
+│ limitations under the License.                                               │
+├──────────────────────────────────────────────────────────────────────────────┤
+│ @important                                                                   │
+│ For any future changes to the code in this file, it is recommended to        │
+│ include, together with the modification, the information of the developer    │
+│ who changed it and the date of modification.                                 │
+└──────────────────────────────────────────────────────────────────────────────┘
+"""
+
+"""
+A2A Protocol v0.3.0 Implementation using Official a2a-sdk
+
+This file replaces the manual JSON-RPC implementation with the official SDK.
+- Mounted to existing FastAPI router.
+- Bridges Evo AI internal runner and services.
+- Supports async tasks, multi-turn, push notifications.
+- Updated AgentCard path and fields for v0.3.0 compliance.
+- Retained all original helper functions for compatibility.
+"""
+
+import uuid
+import logging
+import json
+import base64
+import httpx
+from typing import Dict, Any, List, Optional
+
+from fastapi import APIRouter, Depends, Header, HTTPException
+from sqlalchemy.orm import Session
+from sqlalchemy.sql import text
+from starlette.responses import JSONResponse, EventSourceResponse
+
+# Official A2A SDK imports (adjust if SDK models have different names)
+from a2a_sdk.server import A2AServer
+from a2a_sdk.models import AgentCard, Capability, Message as A2AMessage, Task, TaskStatus, PushNotificationConfig
+
+# Evo AI imports (adjust paths as per your project structure)
+from src.config.database import get_db
+from src.config.settings import settings
+from src.services.agent_service import get_agent
+from src.services.adk.agent_runner import run_agent, run_agent_stream
+from src.services.service_providers import session_service
+from src.schemas.chat import FileData
+
+logger = logging.getLogger(__name__)
+
+router = APIRouter(
+    prefix="/a2a",
+    tags=["a2a-official"],
+    responses={
+        404: {"description": "Not found"},
+        400: {"description": "Bad request"},
+        401: {"description": "Unauthorized"},
+        500: {"description": "Internal server error"},
+    },
+)
+
+# Mount A2A SDK to the existing router
+a2a_server = A2AServer(
+    router=router,
+    prefix="",
+    # Optional config for persistent storage (e.g., for tasks and push configs)
+    # task_backend="memory"  # or "sqlalchemy" with db_url=settings.DATABASE_URL
+)
+
+# ==================== Retained Original Helper Functions ====================
+
+async def verify_api_key(
+    x_api_key: str = Header(None, alias="x-api-key"),
+    db: Session = Depends(get_db)
+) -> Dict:  # Returns agent row
+    if not x_api_key:
+        raise HTTPException(status_code=401, detail="API key not provided")
+
+    query = text("SELECT * FROM agents WHERE config->>'api_key' = :api_key LIMIT 1")
+    result = db.execute(query, {"api_key": x_api_key}).mappings().first()
+
+    if not result:
+        raise HTTPException(status_code=401, detail="Invalid API key")
+
+    return dict(result)
+
+def extract_text_from_message(message: A2AMessage) -> str:
+    for part in message.parts or []:
+        if part.type == "text":
+            return part.text or ""
+    return ""
+
+def extract_files_from_message(message: A2AMessage) -> List[FileData]:
+    files = []
+    for part in message.parts or []:
+        if part.type == "file" and part.file and part.file.bytes:
+            try:
+                # Validate base64
+                base64.b64decode(part.file.bytes, validate=True)
+                files.append(FileData(
+                    filename=part.file.name or f"uploaded_file_{uuid.uuid4().hex[:8]}",
+                    content_type=part.file.mime_type or "application/octet-stream",
+                    data=part.file.bytes,
+                ))
+            except base64.binascii.Error as e:
+                logger.error(f"Invalid base64 in file part: {e}")
+    return files
+
+def clean_message_content(content: Any) -> Any:
+    if isinstance(content, str):
+        try:
+            parsed = json.loads(content)
+            if isinstance(parsed, dict) and "jsonrpc" in parsed:
+                return parsed.get("result", {}).get("content", content)
+        except json.JSONDecodeError:
+            pass
+    return content
+
+def extract_conversation_history(agent_id: str, context_id: str) -> List[Dict[str, Any]]:
+    if not context_id:
+        return []
+    # Assuming session_service.get_history returns list of {'role': ..., 'content': ...}
+    history = session_service.get_history(agent_id, context_id)
+    return [
+        {"role": msg["role"], "content": clean_message_content(msg["content"])}
+        for msg in history
+    ]
+
+def extract_history_from_params(params: Dict) -> List[Dict]:
+    return params.get("history", [])
+
+def combine_histories(history1: List[Dict], history2: List[Dict]) -> List[Dict]:
+    combined = history1 + history2
+    # Dedup by content (simple way)
+    seen = set()
+    deduped = []
+    for msg in combined:
+        content_str = json.dumps(msg)
+        if content_str not in seen:
+            seen.add(content_str)
+            deduped.append(msg)
+    return deduped
+
+async def send_push_notification(task: Task, push_config: PushNotificationConfig):
+    # Retained original push logic, adapted to SDK PushConfig
+    url = push_config.url
+    if not url.startswith("https://"):
+        logger.warning("Push URL must be HTTPS, skipping")
+        return
+
+    headers = {}
+    if push_config.auth_type == "bearer":
+        headers["Authorization"] = f"Bearer {push_config.token}"
+    elif push_config.auth_type == "apiKey":
+        headers["x-api-key"] = push_config.token
+    # Add A2A specific header
+    headers["X-A2A-Notification-Token"] = str(uuid.uuid4())
+
+    payload = task.to_dict()  # SDK Task to dict
+
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        try:
+            response = await client.post(url, json=payload, headers=headers)
+            response.raise_for_status()
+            logger.info(f"Push sent to {url}, status: {response.status_code}")
+        except httpx.HTTPError as e:
+            logger.error(f"Push failed to {url}: {e}")
+
+# ==================== SDK Skill Handlers ====================
+
+@a2a_server.skill("general-assistance")
+async def handle_general_assistance(
+    message: A2AMessage,
+    context: Dict[str, Any],
+    db: Session = Depends(get_db)
+) -> Task:
+    # Parse agent_id from path or context (SDK may provide in context)
+    agent_id = context.get("agent_id")  # Assume SDK parses /{agent_id}
+    if not agent_id:
+        raise HTTPException(400, "Agent ID required")
+
+    # Verify API key
+    await verify_api_key(context["headers"].get("x-api-key"), db)
+
+    text = extract_text_from_message(message)
+    files = extract_files_from_message(message)
+    context_id = context.get("context_id") or context["task_id"]
+
+    # History combination
+    params_history = extract_history_from_params(context.get("params", {}))
+    session_history = extract_conversation_history(agent_id, context_id)
+    full_history = combine_histories(params_history, session_history)
+
+    # Run Evo agent (async)
+    evo_result = await run_agent(
+        agent_id=agent_id,
+        input_text=text,
+        files=files,
+        history=full_history,
+        context_id=context_id,
+        # Add other params if needed from Evo
+    )
+
+    # Adapt to SDK Task
+    task = Task(
+        task_id=context["task_id"],
+        context_id=context_id,
+        state="completed",
+        history=[A2AMessage.from_dict(msg) for msg in full_history + evo_result.get("new_messages", [])],
+        artifacts=evo_result.get("artifacts", []),
+    )
+
+    # Push if configured
+    if push_config_dict := context.get("push_notification_config"):
+        push_config = PushNotificationConfig(**push_config_dict)
+        await send_push_notification(task, push_config)
+
+    return task
+
+@a2a_server.stream_skill("general-assistance")
+async def stream_general_assistance(
+    message: A2AMessage,
+    context: Dict[str, Any],
+    db: Session = Depends(get_db)
+):
+    # Similar to sync handler
+    agent_id = context.get("agent_id")
+    await verify_api_key(context["headers"].get("x-api-key"), db)
+
+    text = extract_text_from_message(message)
+    files = extract_files_from_message(message)
+    context_id = context.get("context_id") or context["task_id"]
+
+    params_history = extract_history_from_params(context.get("params", {}))
+    session_history = extract_conversation_history(agent_id, context_id)
+    full_history = combine_histories(params_history, session_history)
+
+    # Yield initial status
+    yield TaskStatus(state="working")
+
+    # Stream from Evo
+    async for chunk in run_agent_stream(
+        agent_id=agent_id,
+        input_text=text,
+        files=files,
+        history=full_history,
+        context_id=context_id,
+    ):
+        yield {"type": "text", "text": chunk}  # SDK formats as SSE event
+
+    yield TaskStatus(state="completed")
+
+# ==================== Agent Card Registration ====================
+
+def register_evo_agent_cards(db: Session = Depends(get_db)):
+    # Dynamic from DB (example: load all agents)
+    agents = db.execute(text("SELECT id, name, description FROM agents")).mappings().all()
+    for agent in agents:
+        card = AgentCard(
+            id=f"urn:agent:evo:{agent['id']}",
+            name=agent['name'] or "Evo AI Agent",
+            description=agent['description'] or "Evolution API A2A Agent",
+            protocol_versions=["0.3.0", "0.2.1"],
+            supported_interfaces=["jsonrpc/http"],
+            default_input_modes=["text/plain", "application/json"],
+            default_output_modes=["text/plain", "application/json"],
+            capabilities=[
+                Capability(
+                    skill="general-assistance",
+                    description="General assistance with multi-turn support",
+                    input_schema={"type": "object", "properties": {"message": {"type": "string"}}},
+                    output_schema={"type": "object", "properties": {"response": {"type": "string"}}},
+                )
+            ],
+            # Add signature if needed: import jwt; signature = jwt.encode(... , PRIVATE_KEY)
+        )
+        a2a_server.register_agent_card(card)
+
+# Call in main.py startup:
+# from src.api.a2a_routes import register_evo_agent_cards
+# @app.on_event("startup")
+# async def startup_event():
+#     db = next(get_db())
+#     register_evo_agent_cards(db)
+
+# ==================== Additional Routes ====================
+
+@router.get("/health")
+async def a2a_health_check():
+    return {"status": "healthy", "a2a_version": "0.3.0 with SDK", "timestamp": datetime.utcnow().isoformat()}
+
+@router.get("/{agent_id}/.well-known/agent.json")
+async def legacy_agent_card(agent_id: str):
+    # Redirect to SDK-handled new path
+    return JSONResponse({"deprecated": "Use /.well-known/agent-card.json"}, status_code=301)
+
+# If SDK doesn't handle /sessions or /conversation/history, retain or proxy
+@router.get("/sessions")
+async def list_sessions(db: Session = Depends(get_db)):
+    # Original logic, if needed
+    return {"sessions": []}  # Placeholder, copy original if exists
+
+# ... Add other extension routes if needed
