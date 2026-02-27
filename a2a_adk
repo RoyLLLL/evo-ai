@@ -25,18 +25,18 @@
 │ include, together with the modification, the information of the developer    │
 │ who changed it and the date of modification.                                 │
 │                                                                              │
-│ Updated: 2026-XX-XX by [Your Name] - Integrated official a2a-python SDK      │
-│          using mount to existing FastAPI app.                                │
+│ Updated: 2026-XX-XX by [Your Name] - Added dynamic agent mounting on create  │
 └──────────────────────────────────────────────────────────────────────────────┘
 """
 
 """
 A2A Protocol v0.3.0 Implementation using Official a2a-python SDK
-- Uses A2AStarletteApplication + mount to existing FastAPI app
+- Uses A2AStarletteApplication + dynamic mount to existing FastAPI app
 - Bridges Evo AI internal runner and services
 - Supports async tasks, multi-turn, push notifications
 - Updated AgentCard path and fields for v0.3.0 compliance
 - Retained original helper functions for compatibility
+- Supports dynamic mounting for new agents on creation
 """
 
 import uuid
@@ -47,7 +47,7 @@ import httpx
 from typing import Dict, Any, List, Optional
 from datetime import datetime
 
-from fastapi import Depends, Header, HTTPException
+from fastapi import Depends, Header, HTTPException, FastAPI
 from sqlalchemy.orm import Session
 from sqlalchemy.sql import text
 from starlette.responses import JSONResponse
@@ -161,7 +161,7 @@ async def send_push_notification(task: Task, push_config: PushNotificationConfig
 
     headers["X-A2A-Notification-Token"] = str(uuid.uuid4())
 
-    payload = task.dict()  # SDK Task to dict
+    payload = task.dict()
 
     async with httpx.AsyncClient(timeout=30.0) as client:
         try:
@@ -171,25 +171,25 @@ async def send_push_notification(task: Task, push_config: PushNotificationConfig
         except httpx.HTTPError as e:
             logger.error(f"Push failed to {url}: {e}")
 
-# ==================== Custom Request Handler ====================
+# ==================== Custom Dynamic Handler ====================
 
-class EvoRequestHandler(DefaultRequestHandler):
+class EvoDynamicRequestHandler(DefaultRequestHandler):
+    def __init__(self, agent_id: str, push_config_store, push_sender):
+        super().__init__(
+            push_config_store=push_config_store,
+            push_sender=push_sender,
+        )
+        self.agent_id = agent_id
+
     async def handle_send_message(self, request: SendMessageRequest, context: Dict) -> Task:
-        # context 可能包含 headers, path params 等（SDK 提供）
+        agent_id = self.agent_id
+
         headers = context.get("headers", {})
         x_api_key = headers.get("x-api-key")
-        agent_id = context.get("path_params", {}).get("agent_id")  # 假设 SDK 解析 /a2a/{agent_id}
 
-        if not agent_id or not x_api_key:
-            raise ValueError("Missing agent_id or API key")
+        db = next(get_db())
 
-        # 手动注入 db（因为子 app 共享主 app 的 Depends 有限）
-        # 注意：这里假设你能在 handler 中访问 db session（实际可能需 contextvars 或全局）
-        # 简化示例：假设 db 通过其他方式可用，或在 startup 注入
-        # 生产中推荐使用 contextvars 或 dependency_overrides
-        db = next(get_db())  # 临时方案，实际需优化
-
-        agent_row = await verify_api_key(x_api_key, db)
+        await verify_api_key(x_api_key, db)
 
         text = extract_text_from_message(request.message)
         files = extract_files_from_message(request.message)
@@ -220,17 +220,13 @@ class EvoRequestHandler(DefaultRequestHandler):
 
         return task
 
-    # 可选：override stream, get_task 等方法
-    # async def handle_stream_message(...): ...
+# ==================== A2A Sub-App Factory ====================
 
-# ==================== Setup Function (调用在 main.py startup) ====================
-
-def setup_a2a_server():
-    # 构建 AgentCard（可动态从 DB）
+def create_a2a_sub_app_for_agent(agent_id: str, agent_name: str, agent_desc: str):
     agent_card = AgentCard(
-        name="Evo AI Agent",
-        description="Evolution API A2A Agent",
-        url="https://your-domain.com/a2a/",  # 你的实际域名
+        name=agent_name or f"Evo Agent {agent_id}",
+        description=agent_desc or "Evolution API A2A Agent",
+        url=f"https://your-domain.com/a2a/{agent_id}/",
         version="1.0.0",
         protocol_version="0.3.0",
         capabilities=AgentCapabilities(
@@ -241,38 +237,97 @@ def setup_a2a_server():
             AgentSkill(
                 id="general-assistance",
                 name="General Assistance",
-                description="Handles queries and multi-turn conversations",
-                # 可添加 examples, input_schema 等
+                description="Multi-turn queries and tasks",
             )
         ],
-        # default_input_modes 等可选字段
     )
 
-    # Push 配置存储（内存示例，生产用 DB-backed）
     push_config_store = InMemoryPushNotificationConfigStore()
     push_sender = BasePushNotificationSender(httpx.AsyncClient(), push_config_store)
 
-    # 创建自定义 handler
-    handler = EvoRequestHandler(
+    handler = EvoDynamicRequestHandler(
+        agent_id=agent_id,
         push_config_store=push_config_store,
         push_sender=push_sender,
-        # task_store=... 如果需要自定义 task 存储
     )
 
-    # 创建 A2A 子应用
     a2a_app = A2AStarletteApplication(
         agent_card=agent_card,
         http_handler=handler,
     )
 
-    return a2a_app.build()  # 返回 ASGI app，用于 mount
+    return a2a_app.build()
 
-# ==================== 遗留兼容路由（可选保留在主 router） ====================
+# ==================== Dynamic Mount Functions ====================
+
+async def mount_all_evo_agents(app: FastAPI):
+    db = next(get_db())
+    agents_query = text("SELECT id, name, description FROM agents")
+    agents = db.execute(agents_query).mappings().all()
+
+    for agent in agents:
+        agent_id = agent['id']
+        name = agent['name']
+        desc = agent['description']
+
+        sub_app = create_a2a_sub_app_for_agent(agent_id, name, desc)
+
+        app.mount(f"/a2a/{agent_id}", sub_app)
+
+        logger.info(f"Mounted A2A agent: {agent_id} at /a2a/{agent_id}")
+
+async def mount_single_agent(agent_id: str, app: FastAPI, db: Session):
+    query = text("SELECT id, name, description FROM agents WHERE id = :id")
+    agent = db.execute(query, {"id": agent_id}).mappings().first()
+
+    if not agent:
+        raise HTTPException(404, f"Agent {agent_id} not found")
+
+    sub_app = create_a2a_sub_app_for_agent(
+        agent_id=agent_id,
+        agent_name=agent['name'],
+        agent_desc=agent['description']
+    )
+
+    app.mount(f"/a2a/{agent_id}", sub_app)
+
+    logger.info(f"Dynamically mounted A2A for agent: {agent_id}")
+
+# ==================== Legacy / Health Routes ====================
+
+router = APIRouter(prefix="/a2a", tags=["a2a-official"])
+
+@router.get("/health")
+async def a2a_health_check():
+    return {"status": "healthy", "a2a": "v0.3.0 with SDK", "timestamp": datetime.utcnow().isoformat()}
 
 @router.get("/{agent_id}/.well-known/agent.json")
 async def legacy_agent_card(agent_id: str):
     return JSONResponse({"deprecated": "Use /.well-known/agent-card.json"}, status_code=301)
 
-@router.get("/health")
-async def a2a_health_check():
-    return {"status": "healthy", "a2a_version": "0.3.0 with SDK", "timestamp": datetime.utcnow().isoformat()}
+
+
+
+
+
+
+
+
+
+
+
+------------------------------------------
+main中调用：
+# main.py 示例
+from fastapi import FastAPI
+from src.api.a2a_routes import mount_all_evo_agents, router
+
+app = FastAPI(...)
+
+@app.on_event("startup")
+async def startup_event():
+    await mount_all_evo_agents(app)
+
+app.include_router(router)
+
+
