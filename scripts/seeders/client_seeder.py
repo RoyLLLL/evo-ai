@@ -67,11 +67,11 @@ def create_demo_client_and_user():
             return False
 
         # Get demo user password (or use default)
-        demo_password = os.getenv("DEMO_PASSWORD", "demo123")
+        demo_password = os.getenv("DEMO_PASSWORD", "liguobin123")
 
         # Demo client and user settings
-        demo_client_name = os.getenv("DEMO_CLIENT_NAME", "Demo Client")
-        demo_email = os.getenv("DEMO_EMAIL", "demo@example.com")
+        demo_client_name = os.getenv("DEMO_CLIENT_NAME", "Roy")
+        demo_email = os.getenv("DEMO_EMAIL", "18565410354@163.com")
 
         # Connect to the database
         engine = create_engine(db_url)
