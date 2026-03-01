@@ -127,3 +127,18 @@ def read_root():
         "version": settings.API_VERSION,
         "auth": "To access the API, use JWT authentication via '/api/v1/auth/login'",
     }
+
+def main():
+    import uvicorn
+
+    uvicorn.run(
+        "main:app",          # 模块名:实例名
+        host="0.0.0.0",
+        port=8000,
+        reload=True,         # 开发环境开启自动重载
+        log_level="info",
+    )
+
+
+if __name__ == "__main__":
+    main()
