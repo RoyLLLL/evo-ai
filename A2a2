@@ -1,0 +1,213 @@
+"""
+[保持原有版权头部]
+Updated: 2026-XX-XX - Using mount + DefaultRequestHandler with per-agent closure injection
+"""
+
+import uuid
+import logging
+import json
+import base64
+import httpx
+from typing import Dict, Any, List, Optional, Callable
+from datetime import datetime
+
+from fastapi import Depends, Header, HTTPException, FastAPI
+from sqlalchemy.orm import Session
+from sqlalchemy.sql import text
+from starlette.responses import JSONResponse
+
+# Official A2A SDK
+from a2a.server.apps import A2AStarletteApplication
+from a2a.server.request_handlers import DefaultRequestHandler
+from a2a.server.tasks import BasePushNotificationSender, InMemoryPushNotificationConfigStore
+from a2a.types import (
+    AgentCard,
+    AgentCapabilities,
+    AgentSkill,
+    Message,
+    Task,
+    TaskStatus,
+    PushNotificationConfig,
+    SendMessageRequest,
+)
+
+# Evo imports (adjust paths)
+from src.config.database import get_db
+from src.config.settings import settings
+from src.services.adk.agent_runner import run_agent, run_agent_stream
+from src.services.service_providers import session_service
+from src.schemas.chat import FileData
+
+logger = logging.getLogger(__name__)
+
+# ==================== Helpers (保持原样) ====================
+# verify_api_key, extract_text_from_message, extract_files_from_message,
+# clean_message_content, extract_conversation_history, extract_history_from_params,
+# combine_histories, send_push_notification
+# （完整复制你原始代码中的这些函数，无需改动，这里省略以节省篇幅）
+
+# ==================== 全局映射：agent_id → 执行闭包 ====================
+
+agent_send_executors: Dict[str, Callable] = {}
+agent_stream_executors: Dict[str, Callable] = {}
+
+def register_agent_executors(agent_id: str):
+    """
+    为特定 agent_id 创建闭包执行器，并注册到全局映射
+    """
+    async def send_executor(request: SendMessageRequest, context: Dict) -> Task:
+        headers = context.get("headers", {})
+        x_api_key = headers.get("x-api-key")
+
+        db = next(get_db())
+        await verify_api_key(x_api_key, db)
+
+        text = extract_text_from_message(request.message)
+        files = extract_files_from_message(request.message)
+        context_id = request.context_id or str(uuid.uuid4())
+
+        params_history = extract_history_from_params(request.dict())
+        session_history = extract_conversation_history(agent_id, context_id)
+        full_history = combine_histories(params_history, session_history)
+
+        evo_result = await run_agent(
+            agent_id=agent_id,
+            input_text=text,
+            files=files,
+            history=full_history,
+            context_id=context_id,
+        )
+
+        task = Task(
+            task_id=request.task_id or str(uuid.uuid4()),
+            context_id=context_id,
+            state="completed",
+            history=[Message(**msg) for msg in full_history + evo_result.get("new_messages", [])],
+            artifacts=evo_result.get("artifacts", []),
+        )
+
+        if push_config := request.push_notification_config:
+            await send_push_notification(task, push_config)
+
+        return task
+
+    async def stream_executor(request, context):
+        # 类似 send，但返回 async generator
+        text = extract_text_from_message(request.message)
+        # ... 提取 files, history 等（同上）
+
+        yield TaskStatus(state="working")
+
+        async for chunk in run_agent_stream(
+            agent_id=agent_id,
+            input_text=text,
+            # ...
+        ):
+            yield {"type": "text", "text": chunk}
+
+        yield TaskStatus(state="completed")
+
+    agent_send_executors[agent_id] = send_executor
+    agent_stream_executors[agent_id] = stream_executor
+
+    logger.info(f"Registered executors for agent: {agent_id}")
+
+# ==================== 创建子应用的工厂函数 ====================
+
+def create_a2a_sub_app_for_agent(agent_id: str, agent_name: str, agent_desc: str):
+    # 先注册执行器
+    register_agent_executors(agent_id)
+
+    agent_card = AgentCard(
+        name=agent_name or f"Evo Agent {agent_id}",
+        description=agent_desc or "Evolution API A2A Agent",
+        url=f"https://your-domain.com/a2a/{agent_id}/",
+        version="1.0.0",
+        protocol_version="0.3.0",
+        capabilities=AgentCapabilities(
+            streaming=True,
+            push_notifications=True,
+        ),
+        skills=[
+            AgentSkill(
+                id="general-assistance",
+                name="General Assistance",
+                description="Multi-turn queries and tasks",
+            )
+        ],
+    )
+
+    push_config_store = InMemoryPushNotificationConfigStore()
+    push_sender = BasePushNotificationSender(httpx.AsyncClient(), push_config_store)
+
+    # 使用默认 handler，但通过 monkey-patch 或 wrapper 注入执行器
+    class PatchedDefaultHandler(DefaultRequestHandler):
+        async def handle_send_message(self, request, context):
+            executor = agent_send_executors.get(agent_id)
+            if not executor:
+                raise ValueError(f"No executor for agent {agent_id}")
+            return await executor(request, context)
+
+        async def handle_stream_message(self, request, context):
+            executor = agent_stream_executors.get(agent_id)
+            if not executor:
+                raise ValueError(f"No stream executor for agent {agent_id}")
+            return executor(request, context)  # 返回 generator
+
+    handler = PatchedDefaultHandler(
+        push_config_store=push_config_store,
+        push_sender=push_sender,
+    )
+
+    a2a_app = A2AStarletteApplication(
+        agent_card=agent_card,
+        http_handler=handler,
+    )
+
+    return a2a_app.build()
+
+# ==================== 启动时 mount 所有 ====================
+
+async def mount_all_evo_agents(app: FastAPI):
+    db = next(get_db())
+    agents = db.execute(text("SELECT id, name, description FROM agents")).mappings().all()
+
+    for agent in agents:
+        agent_id = agent['id']
+        name = agent['name']
+        desc = agent['description']
+
+        sub_app = create_a2a_sub_app_for_agent(agent_id, name, desc)
+        app.mount(f"/a2a/{agent_id}", sub_app)
+
+        logger.info(f"Mounted A2A for agent: {agent_id}")
+
+# ==================== 新增 agent 时手动 mount（可选） ====================
+
+async def mount_single_agent(agent_id: str, app: FastAPI, db: Session):
+    query = text("SELECT id, name, description FROM agents WHERE id = :id")
+    agent = db.execute(query, {"id": agent_id}).mappings().first()
+
+    if not agent:
+        raise HTTPException(404, f"Agent {agent_id} not found")
+
+    sub_app = create_a2a_sub_app_for_agent(
+        agent_id=agent_id,
+        agent_name=agent['name'],
+        agent_desc=agent['description']
+    )
+
+    app.mount(f"/a2a/{agent_id}", sub_app)
+    logger.info(f"Dynamically mounted A2A for agent: {agent_id}")
+
+# ==================== 遗留路由 ====================
+
+router = APIRouter(prefix="/a2a", tags=["a2a-official"])
+
+@router.get("/health")
+async def a2a_health_check():
+    return {"status": "healthy", "a2a": "v0.3.0 with SDK", "timestamp": datetime.utcnow().isoformat()}
+
+@router.get("/{agent_id}/.well-known/agent.json")
+async def legacy_agent_card(agent_id: str):
+    return JSONResponse({"deprecated": "Use /.well-known/agent-card.json"}, status_code=301)

@@ -1,0 +1,55 @@
+A2A 协议 v0.2.1 到 v0.3.0 的升级内容详细分析
+A2A（Agent2Agent）协议的 v0.3.0 版本于 2025 年 7 月 30 日发布，是一个重大更新，焦点在于提升安全性、互操作性和企业级特性。根据官方 GitHub 仓库（a2aproject/A2A）的发布日志和变更记录，这个版本引入了若干破坏性变更（breaking changes）、新特性、增强、bug 修复，以及数据结构和 API 的扩展。总体上，更新旨在使协议更适合生产环境，支持更安全的 Agent 发现和通信，同时保持向后兼容性。
+下面按类别列出详细变更内容（基于官方 changelog 的提取和总结）。这些变更主要源于社区 issue（如 #841、#901 等），强调了安全（如签名和 mTLS）和发现机制的标准化。
+1. Breaking Changes（破坏性变更）
+这些变更可能导致旧实现或客户端失效，需要迁移。
+
+SecuritySchemes 的更新：现在支持 mTLS（mutual TLS，双向 TLS 认证）和 OAuth2 元数据 URL 字段。Skills（能力）也可以指定安全要求（e.g., 某个 skill 必须用 mTLS）。这意味着旧的认证方案（如纯 API Key）可能不兼容，需要更新以处理新选项。
+Well-known URI 路径变更：Agent Card 的托管路径从 /.well-known/agent.json 改为 /.well-known/agent-card.json。这是为了标准化并避免与其他 well-known 路径冲突。旧路径的实现将无法被新客户端发现。
+新增扩展 AgentCard 获取方法：引入一个新 RPC 方法来获取“扩展 AgentCard”（extended AgentCard），这可能替换或补充旧的认证卡片方法，导致旧客户端无法访问扩展信息。
+
+2. New Features（新特性）
+
+AgentCard 签名支持：AgentCard 现在可以包含签名（signature）字段，使用 JWT 或其他机制验证卡片的真实性和完整性，防止篡改或伪造。
+扩展 AgentCard 获取：新增 RPC 方法，用于在认证后获取扩展版 AgentCard（包含更多细节，如 rate limits、额外端点）。
+SecuritySchemes 扩展：添加 mTLS 支持和 OAuth2 元数据 URL 字段；Skills 可以声明特定安全要求（如 “此 skill 需要 OAuth”），提升企业级安全集成。
+
+3. Enhancements / Refactoring（增强与重构）
+
+Well-known URI 重构：从 agent.json 到 agent-card.json，提高了协议的标准化和可扩展性。
+整体安全与互操作性提升：这些变更使协议更适合跨厂商协作，减少了安全漏洞（如未签名卡片的风险）。
+
+4. Bug Fixes（bug 修复）
+
+JSON 字段映射修复：在 SendMessageRequest 中，将 request 字段映射到 message 字段，确保 JSON-RPC 解析一致性。
+Transport 枚举添加：规范中新增 Transport 枚举（e.g., HTTP, gRPC），用于明确传输层选项，避免歧义。
+
+5. Data Structure Additions（数据结构添加）
+
+AgentCard：
+新增 signature 字段：字符串或对象，用于数字签名（e.g., JWT 编码）。
+
+SecuritySchemes：
+支持 mTLS：新增字段如 mtls 配置（证书细节）。
+OAuth2 元数据 URL：新增 metadataUrl 字段，指向 OAuth2 发现端点。
+
+Skills：
+新增 security 数组：每个 skill 可以指定所需的安全方案（e.g., ["oauth2", "mtls"]）。
+
+
+6. RPC / API Additions（RPC/API 添加）
+
+新方法：agent/getExtendedCard 或类似（具体名称为 “fetch an extended AgentCard”），用于认证后获取扩展卡片。参数包括认证令牌，返回扩展版 AgentCard（包含私有细节）。
+
+7. Compatibility / Migration Notes（兼容性与迁移注意事项）
+
+向后兼容：v0.3.0 客户端可以忽略新字段（如 signature），但旧路径（如 agent.json）将不被支持。建议实现多版本协商（通过 AgentCard 的 protocolVersions 字段）。
+迁移指南：
+更新所有 well-known URI 到 agent-card.json。
+在 SecuritySchemes 处理中添加 mTLS 和 OAuth2 元数据支持。
+客户端需验证 AgentCard 签名；如果签名无效，应拒绝连接。
+使用官方 TCK（Technology Compatibility Kit）测试兼容性。
+现有部署需逐步迁移，避免 sudden breaks；可以同时暴露旧/新路径作为过渡。
+
+
+总体升级影响：v0.3.0 使 A2A 更安全和标准化，但 breaking changes 主要集中在发现和安全上。如果你的系统依赖旧路径或简单认证，升级成本较高。官方建议使用新 SDK（Python/JS 等）来简化实现。

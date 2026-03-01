@@ -1,0 +1,333 @@
+"""
+┌──────────────────────────────────────────────────────────────────────────────┐
+│ @author: Davidson Gomes                                                      │
+│ @file: a2a_routes.py                                                         │
+│ Developed by: Davidson Gomes                                                 │
+│ Creation date: May 23, 2025                                                  │
+│ Contact: contato@evolution-api.com                                           │
+├──────────────────────────────────────────────────────────────────────────────┤
+│ @copyright © Evolution API 2025. All rights reserved.                        │
+│ Licensed under the Apache License, Version 2.0                               │
+│                                                                              │
+│ You may not use this file except in compliance with the License.             │
+│ You may obtain a copy of the License at                                      │
+│                                                                              │
+│    http://www.apache.org/licenses/LICENSE-2.0                                │
+│                                                                              │
+│ Unless required by applicable law or agreed to in writing, software          │
+│ distributed under the License is distributed on an "AS IS" BASIS,            │
+│ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.     │
+│ See the License for the specific language governing permissions and          │
+│ limitations under the License.                                               │
+├──────────────────────────────────────────────────────────────────────────────┤
+│ @important                                                                   │
+│ For any future changes to the code in this file, it is recommended to        │
+│ include, together with the modification, the information of the developer    │
+│ who changed it and the date of modification.                                 │
+│                                                                              │
+│ Updated: 2026-XX-XX by [Your Name] - Added dynamic agent mounting on create  │
+└──────────────────────────────────────────────────────────────────────────────┘
+"""
+
+"""
+A2A Protocol v0.3.0 Implementation using Official a2a-python SDK
+- Uses A2AStarletteApplication + dynamic mount to existing FastAPI app
+- Bridges Evo AI internal runner and services
+- Supports async tasks, multi-turn, push notifications
+- Updated AgentCard path and fields for v0.3.0 compliance
+- Retained original helper functions for compatibility
+- Supports dynamic mounting for new agents on creation
+"""
+
+import uuid
+import logging
+import json
+import base64
+import httpx
+from typing import Dict, Any, List, Optional
+from datetime import datetime
+
+from fastapi import Depends, Header, HTTPException, FastAPI
+from sqlalchemy.orm import Session
+from sqlalchemy.sql import text
+from starlette.responses import JSONResponse
+
+# Official A2A SDK imports (real paths from a2aproject/a2a-python)
+from a2a.server.apps import A2AStarletteApplication
+from a2a.server.request_handlers import DefaultRequestHandler
+from a2a.server.tasks import BasePushNotificationSender, InMemoryPushNotificationConfigStore
+from a2a.types import (
+    AgentCard,
+    AgentCapabilities,
+    AgentSkill,
+    Message,
+    Task,
+    TaskStatus,
+    PushNotificationConfig,
+    SendMessageRequest,
+)
+
+# Evo AI imports (adjust paths as per your project structure)
+from src.config.database import get_db
+from src.config.settings import settings
+from src.services.adk.agent_runner import run_agent, run_agent_stream
+from src.services.service_providers import session_service
+from src.schemas.chat import FileData
+
+logger = logging.getLogger(__name__)
+
+# ==================== Retained Original Helper Functions ====================
+
+async def verify_api_key(
+    x_api_key: str = Header(None, alias="x-api-key"),
+    db: Session = Depends(get_db)
+) -> Dict:
+    if not x_api_key:
+        raise HTTPException(status_code=401, detail="API key not provided")
+
+    query = text("SELECT * FROM agents WHERE config->>'api_key' = :api_key LIMIT 1")
+    result = db.execute(query, {"api_key": x_api_key}).mappings().first()
+
+    if not result:
+        raise HTTPException(status_code=401, detail="Invalid API key")
+
+    return dict(result)
+
+def extract_text_from_message(message: Message) -> str:
+    for part in message.parts or []:
+        if part.type == "text":
+            return part.text or ""
+    return ""
+
+def extract_files_from_message(message: Message) -> List[FileData]:
+    files = []
+    for part in message.parts or []:
+        if part.type == "file" and part.file and part.file.bytes:
+            try:
+                base64.b64decode(part.file.bytes, validate=True)
+                files.append(FileData(
+                    filename=part.file.name or f"uploaded_file_{uuid.uuid4().hex[:8]}",
+                    content_type=part.file.mime_type or "application/octet-stream",
+                    data=part.file.bytes,
+                ))
+            except base64.binascii.Error as e:
+                logger.error(f"Invalid base64 in file part: {e}")
+    return files
+
+def clean_message_content(content: Any) -> Any:
+    if isinstance(content, str):
+        try:
+            parsed = json.loads(content)
+            if isinstance(parsed, dict) and "jsonrpc" in parsed:
+                return parsed.get("result", {}).get("content", content)
+        except json.JSONDecodeError:
+            pass
+    return content
+
+def extract_conversation_history(agent_id: str, context_id: str) -> List[Dict[str, Any]]:
+    if not context_id:
+        return []
+    history = session_service.get_history(agent_id, context_id)
+    return [
+        {"role": msg["role"], "content": clean_message_content(msg["content"])}
+        for msg in history
+    ]
+
+def extract_history_from_params(params: Dict) -> List[Dict]:
+    return params.get("history", [])
+
+def combine_histories(history1: List[Dict], history2: List[Dict]) -> List[Dict]:
+    combined = history1 + history2
+    seen = set()
+    deduped = []
+    for msg in combined:
+        content_str = json.dumps(msg)
+        if content_str not in seen:
+            seen.add(content_str)
+            deduped.append(msg)
+    return deduped
+
+async def send_push_notification(task: Task, push_config: PushNotificationConfig):
+    url = push_config.url
+    if not url.startswith("https://"):
+        logger.warning("Push URL must be HTTPS, skipping")
+        return
+
+    headers = {}
+    if push_config.auth_type == "bearer":
+        headers["Authorization"] = f"Bearer {push_config.token}"
+    elif push_config.auth_type == "apiKey":
+        headers["x-api-key"] = push_config.token
+
+    headers["X-A2A-Notification-Token"] = str(uuid.uuid4())
+
+    payload = task.dict()
+
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        try:
+            response = await client.post(url, json=payload, headers=headers)
+            response.raise_for_status()
+            logger.info(f"Push sent to {url}, status: {response.status_code}")
+        except httpx.HTTPError as e:
+            logger.error(f"Push failed to {url}: {e}")
+
+# ==================== Custom Dynamic Handler ====================
+
+class EvoDynamicRequestHandler(DefaultRequestHandler):
+    def __init__(self, agent_id: str, push_config_store, push_sender):
+        super().__init__(
+            push_config_store=push_config_store,
+            push_sender=push_sender,
+        )
+        self.agent_id = agent_id
+
+    async def handle_send_message(self, request: SendMessageRequest, context: Dict) -> Task:
+        agent_id = self.agent_id
+
+        headers = context.get("headers", {})
+        x_api_key = headers.get("x-api-key")
+
+        db = next(get_db())
+
+        await verify_api_key(x_api_key, db)
+
+        text = extract_text_from_message(request.message)
+        files = extract_files_from_message(request.message)
+        context_id = request.context_id or str(uuid.uuid4())
+
+        params_history = extract_history_from_params(request.dict())
+        session_history = extract_conversation_history(agent_id, context_id)
+        full_history = combine_histories(params_history, session_history)
+
+        evo_result = await run_agent(
+            agent_id=agent_id,
+            input_text=text,
+            files=files,
+            history=full_history,
+            context_id=context_id,
+        )
+
+        task = Task(
+            task_id=request.task_id or str(uuid.uuid4()),
+            context_id=context_id,
+            state="completed",
+            history=[Message(**msg) for msg in full_history + evo_result.get("new_messages", [])],
+            artifacts=evo_result.get("artifacts", []),
+        )
+
+        if push_config := request.push_notification_config:
+            await send_push_notification(task, push_config)
+
+        return task
+
+# ==================== A2A Sub-App Factory ====================
+
+def create_a2a_sub_app_for_agent(agent_id: str, agent_name: str, agent_desc: str):
+    agent_card = AgentCard(
+        name=agent_name or f"Evo Agent {agent_id}",
+        description=agent_desc or "Evolution API A2A Agent",
+        url=f"https://your-domain.com/a2a/{agent_id}/",
+        version="1.0.0",
+        protocol_version="0.3.0",
+        capabilities=AgentCapabilities(
+            streaming=True,
+            push_notifications=True,
+        ),
+        skills=[
+            AgentSkill(
+                id="general-assistance",
+                name="General Assistance",
+                description="Multi-turn queries and tasks",
+            )
+        ],
+    )
+
+    push_config_store = InMemoryPushNotificationConfigStore()
+    push_sender = BasePushNotificationSender(httpx.AsyncClient(), push_config_store)
+
+    handler = EvoDynamicRequestHandler(
+        agent_id=agent_id,
+        push_config_store=push_config_store,
+        push_sender=push_sender,
+    )
+
+    a2a_app = A2AStarletteApplication(
+        agent_card=agent_card,
+        http_handler=handler,
+    )
+
+    return a2a_app.build()
+
+# ==================== Dynamic Mount Functions ====================
+
+async def mount_all_evo_agents(app: FastAPI):
+    db = next(get_db())
+    agents_query = text("SELECT id, name, description FROM agents")
+    agents = db.execute(agents_query).mappings().all()
+
+    for agent in agents:
+        agent_id = agent['id']
+        name = agent['name']
+        desc = agent['description']
+
+        sub_app = create_a2a_sub_app_for_agent(agent_id, name, desc)
+
+        app.mount(f"/a2a/{agent_id}", sub_app)
+
+        logger.info(f"Mounted A2A agent: {agent_id} at /a2a/{agent_id}")
+
+async def mount_single_agent(agent_id: str, app: FastAPI, db: Session):
+    query = text("SELECT id, name, description FROM agents WHERE id = :id")
+    agent = db.execute(query, {"id": agent_id}).mappings().first()
+
+    if not agent:
+        raise HTTPException(404, f"Agent {agent_id} not found")
+
+    sub_app = create_a2a_sub_app_for_agent(
+        agent_id=agent_id,
+        agent_name=agent['name'],
+        agent_desc=agent['description']
+    )
+
+    app.mount(f"/a2a/{agent_id}", sub_app)
+
+    logger.info(f"Dynamically mounted A2A for agent: {agent_id}")
+
+# ==================== Legacy / Health Routes ====================
+
+router = APIRouter(prefix="/a2a", tags=["a2a-official"])
+
+@router.get("/health")
+async def a2a_health_check():
+    return {"status": "healthy", "a2a": "v0.3.0 with SDK", "timestamp": datetime.utcnow().isoformat()}
+
+@router.get("/{agent_id}/.well-known/agent.json")
+async def legacy_agent_card(agent_id: str):
+    return JSONResponse({"deprecated": "Use /.well-known/agent-card.json"}, status_code=301)
+
+
+
+
+
+
+
+
+
+
+
+
+------------------------------------------
+main中调用：
+# main.py 示例
+from fastapi import FastAPI
+from src.api.a2a_routes import mount_all_evo_agents, router
+
+app = FastAPI(...)
+
+@app.on_event("startup")
+async def startup_event():
+    await mount_all_evo_agents(app)
+
+app.include_router(router)
+
+
